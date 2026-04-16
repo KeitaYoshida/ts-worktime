@@ -8,26 +8,38 @@ import os
 import sys
 import signal
 import time
-import json
 import subprocess
 import threading
 import traceback
 from datetime import datetime
 
 # サードパーティライブラリ
+import requests
 import tkinter as tk
 from tkinter import ttk, messagebox
-import RPi.GPIO as GPIO
-import sdnotify
-from smartcard.scard import SCardReleaseContext, SCardGetErrorMessage, SCARD_S_SUCCESS
 
 # ローカルモジュール
-from gui import create_gui
-from card_reader import initialize_context, list_readers, monitor_readers
-from db import initialize_db, fetch_user_data
+from gui import create_gui, open_registration_window, update_user_label
+from card_reader import (
+    SMARTCARD_AVAILABLE,
+    initialize_context,
+    list_readers,
+    monitor_readers,
+    release_context,
+)
+from db import initialize_db, get_user_by_serial, save_to_db, update_attendance
 from config import load_config
 from logger import logger
-from util.beep import setup_buzzer, cleanup_buzzer, set_volume  # ブザー関連の関数をインポート
+from platform_compat import IS_LINUX, IS_MAC, create_notifier
+from registration import RegistrationSession
+from user_service import register_user_card, sync_user_data
+from util.beep import (
+    setup_buzzer,
+    cleanup_buzzer,
+    set_volume,
+    play_error_melody,
+    play_success_melody,
+)
 
 # デバッグ情報の出力
 logger.debug(f"Python version: {sys.version}")
@@ -37,6 +49,8 @@ logger.debug(f"Environment variables: {os.environ}")
 
 # Xサーバーが利用可能かチェック
 def check_x_server():
+    if not IS_LINUX:
+        return True
     try:
         subprocess.run(['xset', 'q'], capture_output=True, check=True)
         return True
@@ -48,7 +62,8 @@ def check_x_server():
         return False
 
 # systemd通知用のオブジェクト
-notifier = sdnotify.SystemdNotifier()
+notifier = create_notifier()
+root = None
 
 def restart_application():
     """アプリケーションを再起動"""
@@ -115,6 +130,9 @@ def check_display():
     """
     DISPLAY環境変数が正しく設定されているか確認
     """
+    if IS_MAC:
+        return True
+
     display = os.environ.get('DISPLAY')
     if not display:
         logger.error("DISPLAY環境変数が設定されていません")
@@ -163,31 +181,37 @@ def main():
         context = initialize_context()
         logger.debug("カードリーダーコンテキストを初期化しました")
 
-        # ユーザーデータ取得（最大3回リトライ）
-        retry_count = 0
-        max_retries = 3
-        user_data = None
-        
-        while retry_count < max_retries:
-            try:
-                user_data = fetch_user_data(config)
-                if user_data:
-                    logger.info(f"ユーザーデータを取得しました（{len(user_data)}件）")
-                    break
-                else:
+        def sync_users_with_retry():
+            retry_count = 0
+            max_retries = 3
+
+            while retry_count < max_retries:
+                try:
+                    user_data = sync_user_data(config)
+                    if user_data:
+                        logger.info(f"ユーザーデータを取得しました（{len(user_data)}件）")
+                        return True
                     retry_count += 1
                     if retry_count < max_retries:
-                        logger.warning(f"ユーザーデータの取得に失敗しました。{retry_count}回目のリトライを実行します...")
-                        time.sleep(2)  # 2秒待機してリトライ
-                    else:
-                        logger.error("ユーザーデータの取得に失敗しました。最大リトライ回数を超えました。")
-            except Exception as e:
-                retry_count += 1
-                if retry_count < max_retries:
-                    logger.warning(f"ユーザーデータの取得中にエラーが発生: {e}。{retry_count}回目のリトライを実行します...")
-                    time.sleep(2)
-                else:
-                    logger.error(f"ユーザーデータの取得中にエラーが発生: {e}。最大リトライ回数を超えました。")
+                        logger.warning(
+                            "ユーザーデータの取得に失敗しました。%s回目のリトライを実行します...",
+                            retry_count,
+                        )
+                        time.sleep(2)
+                except Exception as e:
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        logger.warning(
+                            "ユーザーデータの取得中にエラーが発生: %s。%s回目のリトライを実行します...",
+                            e,
+                            retry_count,
+                        )
+                        time.sleep(2)
+
+            logger.error("ユーザーデータの取得に失敗しました。最大リトライ回数を超えました。")
+            return False
+
+        sync_users_with_retry()
 
         try:
             # カードリーダー一覧を取得
@@ -203,19 +227,198 @@ def main():
             root = tk.Tk()
             root.title("出退勤管理")
 
+            registration_session = RegistrationSession()
+
+            def show_registration_mode(user_name):
+                info_label.config(
+                    text=f"カード登録モード\n{user_name} さんのカードを待機中...",
+                    fg="#1E3A8A",
+                    bg="#FEF3C7",
+                )
+
+            def clear_registration_mode():
+                current_state = state_var.get()
+                current_bg = "#D8E3FF" if current_state == "出勤" else "#FEE2E2"
+                info_label.config(
+                    text=f"現在のステータス: {current_state}\nカード受付待機中...",
+                    fg="#1E3A8A",
+                    bg=current_bg,
+                )
+
             # GUI生成
-            state_var, time_label, info_label = create_gui(root, config)
+            state_var, time_label, info_label = create_gui(
+                root,
+                config,
+                lambda: open_registration_window(
+                    root,
+                    registration_session,
+                    sync_users_with_retry,
+                    show_registration_mode,
+                    clear_registration_mode,
+                ),
+            )
 
             # スレッド停止用イベント
             stop_event = threading.Event()
 
+            def show_attendance_success(name, state):
+                info_label.after(
+                    100,
+                    lambda: update_user_label(
+                        info_label,
+                        f"{name} さんの記録成功",
+                        state,
+                        "#D8E3FF",
+                        text_color="#1E3A8A",
+                        font_weight="bold",
+                        change_bg=False,
+                    ),
+                )
+
+            def show_attendance_error(message, state):
+                info_label.after(
+                    1000,
+                    lambda: update_user_label(
+                        info_label,
+                        message,
+                        state,
+                        "#FECACA",
+                        text_color="#C2185B",
+                        font_weight="bold",
+                        change_bg=False,
+                    ),
+                )
+
+            def handle_attendance_card(serial_number):
+                current_state = state_var.get()
+                logger.info(
+                    "カード処理開始 - シリアル: %s, 状態: %s",
+                    serial_number,
+                    current_state,
+                )
+
+                user_info = get_user_by_serial(serial_number)
+                if not user_info:
+                    logger.warning("未登録のシリアル番号: %s", serial_number)
+                    play_error_melody()
+                    show_attendance_error(
+                        "シリアル番号が未登録です。カード登録から設定してください",
+                        current_state,
+                    )
+                    return
+
+                save_record = save_to_db(serial_number, current_state, user_info)
+
+                try:
+                    api_url = config.get("set_timestamp_api")
+                    payload = {
+                        "marge_id": save_record["id"],
+                        "serial_no": serial_number,
+                        "state": current_state,
+                        "user_id": user_info.get("res_user_id"),
+                        "user_name": user_info.get("name"),
+                        "timestamp": datetime.now().isoformat(),
+                    }
+                    response = requests.post(api_url, json=payload, timeout=5)
+
+                    if response.status_code in [200, 201]:
+                        update_attendance(save_record["id"], "marge", 1)
+                        logger.info("処理成功 - ユーザー: %s", user_info["name"])
+                        play_success_melody()
+                        show_attendance_success(user_info["name"], current_state)
+                        return
+
+                    error_msg = f"API送信失敗: {response.status_code}"
+                    logger.error(error_msg)
+                    play_error_melody()
+                    show_attendance_error(error_msg, current_state)
+                except requests.Timeout:
+                    logger.error("API送信がタイムアウトしました")
+                    play_error_melody()
+                    show_attendance_error("サーバー接続がタイムアウトしました", current_state)
+                except requests.RequestException as e:
+                    logger.error("API送信エラー: %s", e)
+                    play_error_melody()
+                    show_attendance_error(f"API送信中エラー: {e}", current_state)
+
+            def handle_registration_card(serial_number):
+                selected_user = registration_session.get_selected_user()
+                if not selected_user:
+                    play_error_melody()
+                    messagebox.showwarning("カード登録", "先に登録するユーザーを選択してください。")
+                    return
+
+                success, error_message = register_user_card(
+                    config,
+                    selected_user["id"],
+                    serial_number,
+                )
+
+                if success:
+                    registration_session.clear()
+                    clear_registration_mode()
+                    close_registration_view = getattr(root, "_close_registration_view", None)
+                    if close_registration_view is not None:
+                        close_registration_view()
+                    play_success_melody()
+                    current_state = state_var.get()
+                    info_label.after(
+                        100,
+                        lambda: update_user_label(
+                            info_label,
+                            f"{selected_user['name']} さんにカードを登録しました",
+                            current_state,
+                            "#D8E3FF",
+                            text_color="#1E3A8A",
+                            font_weight="bold",
+                            change_bg=False,
+                        ),
+                    )
+                    messagebox.showinfo(
+                        "カード登録完了",
+                        f"{selected_user['name']} さんへカードを登録しました。",
+                    )
+                    return
+
+                play_error_melody()
+                current_state = state_var.get()
+                show_attendance_error(error_message, current_state)
+                messagebox.showerror("カード登録エラー", error_message)
+
+            def handle_detected_card(serial_number):
+                if getattr(root, "_registration_mode_visible", False):
+                    root.after(0, lambda: handle_registration_card(serial_number))
+                else:
+                    handle_attendance_card(serial_number)
+
+            def handle_reader_error(message):
+                current_state = state_var.get()
+                show_attendance_error(message, current_state)
+
+            if not SMARTCARD_AVAILABLE:
+                info_label.config(
+                    text="開発モード\nカードリーダー機能は無効です",
+                    fg="#1E3A8A",
+                    bg="#E2E8F0",
+                )
+
             # リーダー監視スレッド開始
             monitor_thread = threading.Thread(
                 target=monitor_readers,
-                args=(context, readers, state_var, root, info_label, config, stop_event),
-                daemon=True
+                args=(context, readers, handle_detected_card, handle_reader_error, stop_event),
+                daemon=True,
             )
             monitor_thread.start()
+
+            def user_sync_worker():
+                while not stop_event.wait(300):
+                    try:
+                        sync_user_data(config)
+                    except Exception as exc:
+                        logger.error("定期ユーザー同期エラー: %s", exc)
+
+            sync_thread = threading.Thread(target=user_sync_worker, daemon=True)
+            sync_thread.start()
 
             # Watchdog通知用スレッド
             def watchdog_notifier():
@@ -230,6 +433,8 @@ def main():
             def on_closing():
                 logger.info("アプリケーションを終了します...")
                 stop_event.set()
+                registration_session.clear()
+                clear_registration_mode()
                 notifier.notify("STOPPING=1")
                 root.destroy()
                 sys.exit(0)
@@ -260,11 +465,8 @@ def main():
         finally:
             # PC/SCコンテキストを解放
             try:
-                hresult = SCardReleaseContext(context)
-                if hresult != SCARD_S_SUCCESS:
-                    logger.error(f"コンテキストの解放に失敗: {SCardGetErrorMessage(hresult)}")
-                else:
-                    logger.info("コンテキストを解放しました")
+                release_context(context)
+                logger.info("コンテキストを解放しました")
             except Exception as e:
                 logger.error(f"コンテキスト解放中にエラー: {e}")
 

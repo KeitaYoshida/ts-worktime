@@ -1,5 +1,9 @@
-import RPi.GPIO as GPIO
 import time
+
+try:
+    import RPi.GPIO as GPIO
+except Exception:
+    GPIO = None
 
 BUZZER_PIN = 18  # GPIO 18を使用
 
@@ -18,9 +22,12 @@ NOTES = {
 # デフォルトの音量 (0-100)
 DEFAULT_VOLUME = 50
 current_volume = DEFAULT_VOLUME
+pwm = None
 
 def setup_buzzer():
     """ブザーの初期化"""
+    if GPIO is None:
+        return
     GPIO.setmode(GPIO.BCM)
     GPIO.setup(BUZZER_PIN, GPIO.OUT)
     GPIO.setwarnings(False)
@@ -30,6 +37,8 @@ def setup_buzzer():
 
 def cleanup_buzzer():
     """ブザーのクリーンアップ"""
+    if GPIO is None or pwm is None:
+        return
     try:
         pwm.stop()
         GPIO.cleanup(BUZZER_PIN)
@@ -52,6 +61,9 @@ def play_tone(frequency, duration):
         frequency (int): 周波数（Hz）
         duration (float): 長さ（秒）
     """
+    if GPIO is None or pwm is None:
+        time.sleep(duration)
+        return
     try:
         pwm.ChangeFrequency(frequency)
         # 音量に応じてデューティ比を調整（最大50%）

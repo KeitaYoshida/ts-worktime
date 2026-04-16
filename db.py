@@ -154,12 +154,53 @@ def get_user_by_serial(serial_number):
     """
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT res_user_id, name FROM users WHERE id_serial = ?", (serial_number,))
+    cursor.execute(
+        "SELECT res_user_id, name, login_id FROM users WHERE id_serial = ?",
+        (str(serial_number),),
+    )
     result = cursor.fetchone()
     conn.close()
     if result:
-        return {"res_user_id": result[0], "name": result[1]}
+        return {
+            "res_user_id": result[0],
+            "name": result[1],
+            "login_id": result[2],
+        }
     return None
+
+
+def get_all_users():
+    """登録用画面で利用するユーザー一覧を返す"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT res_user_id, name, login_id, id_serial
+        FROM users
+        ORDER BY name COLLATE NOCASE, res_user_id
+        """
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def update_user_serial(user_id, serial_number):
+    """ユーザーにカードシリアルを紐付ける"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE users
+        SET id_serial = ?
+        WHERE res_user_id = ?
+        """,
+        (str(serial_number), user_id),
+    )
+    conn.commit()
+    updated = cursor.rowcount
+    conn.close()
+    return updated > 0
 
 
 def save_to_db(serial_number, state, user_info):

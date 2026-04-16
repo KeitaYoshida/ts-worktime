@@ -1,12 +1,12 @@
 {
-    "server_helth_api": "http://192.168.11.103:8000/api/helth",
-    "user_list_api": "http://192.168.11.103:8000/api/user/list-low",
-    "set_timestamp_api": "http://192.168.11.103:8000/api/set/timestamp",
-    "user_data_file": "user_data.json",
-    "set_user_serial": "http://192.168.11.103:8000/api/user/update",
-    "marge_api": "http://192.168.11.103:8000/api/attendance/marge",
-    "server_url": "",
-    "user_id": "",
-    "auto_sync": true,
-    "buzzer_volume": 70
+  "server_helth_api": "http://192.168.13.103:8000/api/helth",
+  "user_list_api": "http://192.168.13.103:8000/api/user/list-low",
+  "set_timestamp_api": "http://192.168.13.103:8000/api/set/timestamp",
+  "user_data_file": "user_data.json",
+  "set_user_serial": "http://192.168.13.103:8000/api/user/update",
+  "marge_api": "http://192.168.13.103:8000/api/attendance/marge",
+  "server_url": "",
+  "user_id": "",
+  "auto_sync": true,
+  "buzzer_volume": 70
 }

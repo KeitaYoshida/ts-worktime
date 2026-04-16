@@ -1,35 +1,58 @@
 import time
-import requests
-from datetime import datetime
 import os
-from pathlib import Path
+import sys
 
-import smartcard.util
-from smartcard.scard import (
-    SCardEstablishContext,
-    SCardListReaders,
-    SCardGetErrorMessage,
-    SCardGetStatusChange,
-    SCardConnect,
-    SCardDisconnect,
-    SCARD_SCOPE_USER,
-    SCARD_STATE_UNAWARE,
-    SCARD_STATE_PRESENT,
-    SCARD_SHARE_SHARED,
-    SCARD_PROTOCOL_T0,
-    SCARD_PROTOCOL_T1,
-    SCARD_UNPOWER_CARD,
-    SCardTransmit,
-    SCARD_PCI_T1,
-    SCARD_S_SUCCESS,
-)
+try:
+    import smartcard.util
+    from smartcard.scard import (
+        SCardEstablishContext,
+        SCardListReaders,
+        SCardGetErrorMessage,
+        SCardGetStatusChange,
+        SCardConnect,
+        SCardDisconnect,
+        SCARD_SCOPE_USER,
+        SCARD_STATE_UNAWARE,
+        SCARD_STATE_PRESENT,
+        SCARD_SHARE_SHARED,
+        SCARD_PROTOCOL_T0,
+        SCARD_PROTOCOL_T1,
+        SCARD_UNPOWER_CARD,
+        SCardTransmit,
+        SCARD_PCI_T1,
+        SCARD_S_SUCCESS,
+        SCardReleaseContext,
+    )
+    SMARTCARD_AVAILABLE = True
+except Exception:
+    smartcard = None
+    SCardEstablishContext = None
+    SCardListReaders = None
+    SCardGetErrorMessage = None
+    SCardGetStatusChange = None
+    SCardConnect = None
+    SCardDisconnect = None
+    SCARD_SCOPE_USER = None
+    SCARD_STATE_UNAWARE = None
+    SCARD_STATE_PRESENT = None
+    SCARD_SHARE_SHARED = None
+    SCARD_PROTOCOL_T0 = None
+    SCARD_PROTOCOL_T1 = None
+    SCARD_UNPOWER_CARD = None
+    SCardTransmit = None
+    SCARD_PCI_T1 = None
+    SCARD_S_SUCCESS = None
+    SCardReleaseContext = None
+    SMARTCARD_AVAILABLE = False
 
-from db import get_user_by_serial, save_to_db, update_attendance
-from util.beep import beep, play_error_melody, play_success_melody
+from util.beep import beep
 from logger import logger
 
 def initialize_context():
     """PC/SCコンテキストを確立する"""
+    if not SMARTCARD_AVAILABLE:
+        logger.warning("smartcard ライブラリが未導入のため、カードリーダー機能を無効化します")
+        return None
     try:
         hresult, context = SCardEstablishContext(SCARD_SCOPE_USER)
         if hresult != SCARD_S_SUCCESS:
@@ -44,6 +67,8 @@ def initialize_context():
 
 def list_readers(context):
     """スマートカードリーダーのリストを取得する"""
+    if not SMARTCARD_AVAILABLE or context is None:
+        return []
     try:
         hresult, readers = SCardListReaders(context, [])
         if hresult != SCARD_S_SUCCESS:
@@ -62,6 +87,8 @@ def list_readers(context):
 
 def get_card_serial_number(card):
     """カードのシリアル番号を取得して10進数に変換"""
+    if not SMARTCARD_AVAILABLE:
+        return None
     APDU_GET_UID = [0xFF, 0xCA, 0x00, 0x00, 0x00]
 
     try:
@@ -89,87 +116,13 @@ def get_card_serial_number(card):
         logger.error(f"シリアル番号取得中の予期せぬエラー: {e}")
         return None
 
-def handle_card_data(serial_number, state_var, config, callback_success, callback_error):
-    """カードデータの処理"""
-    try:
-        current_state = state_var.get()
-        logger.info(f"カード処理開始 - シリアル: {serial_number}, 状態: {current_state}")
-        
-        user_info = get_user_by_serial(serial_number)
-        if not user_info:
-            logger.warning(f"未登録のシリアル番号: {serial_number}")
-            play_error_melody()
-            callback_error("シリアル番号が未登録です。ユーザー設定から登録してください", current_state)
-            return
-
-        # DBに保存
-        save_record = save_to_db(serial_number, current_state, user_info)
-        logger.debug(f"DB保存完了 - ID: {save_record['id']}")
-        
-        # API送信
-        try:
-            api_url = config.get("set_timestamp_api")
-            payload = {
-                "marge_id": save_record['id'],
-                "serial_no": serial_number,
-                "state": current_state,
-                "user_id": user_info.get("res_user_id"),
-                "user_name": user_info.get("name"),
-                "timestamp": datetime.now().isoformat()
-            }
-            logger.debug(f"API送信開始: {api_url}")
-            response = requests.post(api_url, json=payload, timeout=5)  # タイムアウト追加
-            
-            if response.status_code in [200, 201]:
-                update_attendance(save_record['id'], 'marge', 1)
-                logger.info(f"処理成功 - ユーザー: {user_info['name']}")
-                play_success_melody()
-                callback_success(user_info["name"], current_state)
-            else:
-                error_msg = f"API送信失敗: {response.status_code}"
-                logger.error(error_msg)
-                play_error_melody()
-                callback_error(error_msg, current_state)
-        except requests.Timeout:
-            logger.error("API送信がタイムアウトしました")
-            play_error_melody()
-            callback_error("サーバー接続がタイムアウトしました", current_state)
-        except requests.RequestException as e:
-            logger.error(f"API送信エラー: {e}")
-            play_error_melody()
-            callback_error(f"API送信中エラー: {e}", current_state)
-    except Exception as e:
-        logger.error(f"カード処理中の予期せぬエラー: {e}")
-        play_error_melody()
-        callback_error("システムエラーが発生しました", current_state)
-
-def monitor_readers(context, readers, state_var, root, info_label, config, stop_event):
+def monitor_readers(context, readers, on_card_detected, on_error, stop_event):
     """カードリーダーの監視"""
-    from gui import update_user_label
-
-    def on_success(name, state):
-        # 即時フィードバック（0.1秒後にリセット）
-        info_label.after(100, lambda: update_user_label(
-            info_label,
-            f"{name} さんの記録成功",
-            state,
-            "#D8E3FF",
-            text_color="#1E3A8A",
-            font_weight="bold",
-            change_bg=False
-        ))
-    
-    def on_error(message, state):
-        # エラー表示は1秒間表示
-        info_label.after(1000, lambda: update_user_label(
-            info_label,
-            message,
-            state,
-            "#FECACA",
-            text_color="#C2185B",
-            font_weight="bold",
-            change_bg=False
-        ))
+    if not SMARTCARD_AVAILABLE or context is None or not readers:
+        logger.info("カードリーダー監視は無効です")
+        while not stop_event.wait(1):
+            pass
+        return
 
     last_card_time = 0  # 最後のカード読み取り時刻
     
@@ -200,13 +153,13 @@ def monitor_readers(context, readers, state_var, root, info_label, config, stop_
                                     serial_number = get_card_serial_number(card)
                                     if serial_number is not None:
                                         beep()
-                                        handle_card_data(serial_number, state_var, config, on_success, on_error)
+                                        on_card_detected(serial_number)
                                         last_card_time = current_time
                                 finally:
                                     SCardDisconnect(card, SCARD_UNPOWER_CARD)
                             except Exception as e:
                                 logger.error(f"カード接続エラー: {e}")
-                                on_error("カードの読み取りに失敗しました", state_var.get())
+                                on_error("カードの読み取りに失敗しました")
 
                 time.sleep(0.1)  # ポーリング間隔を0.1秒に短縮
             except Exception as e:
@@ -215,10 +168,13 @@ def monitor_readers(context, readers, state_var, root, info_label, config, stop_
                 
     except Exception as e:
         logger.critical(f"致命的なエラーが発生: {e}")
-        if root:
-            logger.info("アプリケーションを再起動します...")
-            root.after(0, lambda: (
-                root.quit(),
-                root.destroy(),
-                os.execv(sys.executable, ['python'] + sys.argv)
-            ))
+        logger.info("アプリケーションを再起動します...")
+        os.execv(sys.executable, ['python'] + sys.argv)
+
+
+def release_context(context):
+    if not SMARTCARD_AVAILABLE or context is None or SCardReleaseContext is None:
+        return
+    hresult = SCardReleaseContext(context)
+    if hresult != SCARD_S_SUCCESS:
+        raise RuntimeError(f"コンテキストの解放に失敗: {SCardGetErrorMessage(hresult)}")

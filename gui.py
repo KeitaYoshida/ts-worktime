@@ -1,19 +1,136 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, font
 from datetime import datetime
 import csv
 import zipfile
 import sqlite3
 import requests
 import json
+import threading
 
 from config import save_config
-from db import DB_FILE
+from db import DB_FILE, get_all_users
+from platform_compat import IS_MAC
 
 
-import tkinter as tk
-from tkinter import ttk
-from tkinter import font
+SURFACE_BG = "#F3F7FB"
+PANEL_BG = "#FFFFFF"
+PRIMARY_TEXT = "#17324D"
+SECONDARY_TEXT = "#5B7087"
+ACCENT_BLUE = "#2F6FED"
+ACCENT_BLUE_SOFT = "#E7F0FF"
+ACCENT_CORAL = "#F46B5F"
+ACCENT_CORAL_SOFT = "#FFE6E2"
+SHADOW_COLOR = "#D7E3F4"
+HEADER_TOP_BG = "#F2F8FF"
+HEADER_BOTTOM_BG = "#E5F0FF"
+REGISTER_TOP_BG = "#FFF8F0"
+REGISTER_BOTTOM_BG = "#FFEADB"
+
+STATUS_COLORS = {
+    "出勤": "#D9E8FF",
+    "退勤": "#FFE3DF",
+    "外出": "#DDF8EA",
+    "戻り": "#EEE1FF",
+}
+
+BUTTON_COLORS = {
+    "出勤": {"bg": "#4F7DFF", "active": "#3E67D5", "text": "#FFFFFF"},
+    "退勤": {"bg": "#FF8A7A", "active": "#E16F60", "text": "#FFFFFF"},
+}
+
+
+def bind_pressable_label(widget, command, default_bg, hover_bg, fg):
+    widget.configure(bg=default_bg, fg=fg, cursor="hand2")
+    widget.bind("<Enter>", lambda _e: widget.configure(bg=hover_bg))
+    widget.bind("<Leave>", lambda _e: widget.configure(bg=default_bg))
+    widget.bind("<Button-1>", lambda _e: command())
+
+
+def _rounded_polygon_points(x1, y1, x2, y2, radius):
+    return [
+        x1 + radius, y1,
+        x2 - radius, y1,
+        x2, y1,
+        x2, y1 + radius,
+        x2, y2 - radius,
+        x2, y2,
+        x2 - radius, y2,
+        x1 + radius, y2,
+        x1, y2,
+        x1, y2 - radius,
+        x1, y1 + radius,
+        x1, y1,
+    ]
+
+
+def create_rounded_button(parent, text, command, bg, hover_bg, fg, width=240, height=84, radius=28):
+    canvas = tk.Canvas(
+        parent,
+        width=width,
+        height=height,
+        highlightthickness=0,
+        bd=0,
+        bg=PANEL_BG,
+    )
+
+    shadow = canvas.create_polygon(
+        _rounded_polygon_points(6, 7, width - 6, height - 3, radius),
+        smooth=True,
+        fill="#E2E8F2",
+        outline="",
+    )
+    shape = canvas.create_polygon(
+        _rounded_polygon_points(4, 4, width - 8, height - 8, radius),
+        smooth=True,
+        fill=bg,
+        outline="",
+    )
+    label = canvas.create_text(
+        width / 2,
+        height / 2,
+        text=text,
+        fill=fg,
+        font=("Noto Sans", 18, "bold"),
+    )
+
+    def set_fill(color):
+        canvas.itemconfigure(shape, fill=color)
+
+    for target in (canvas,):
+        target.bind("<Enter>", lambda _e: set_fill(hover_bg))
+        target.bind("<Leave>", lambda _e: set_fill(bg))
+        target.bind("<Button-1>", lambda _e: command())
+
+    return canvas
+
+
+def create_shadow_card(parent, bg=PANEL_BG, pad=(14, 14)):
+    outer = tk.Frame(parent, bg=SHADOW_COLOR)
+    inner = tk.Frame(outer, bg=bg)
+    inner.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+    if pad:
+        content = tk.Frame(inner, bg=bg, padx=pad[0], pady=pad[1])
+        content.pack(fill=tk.BOTH, expand=True)
+    else:
+        content = inner
+    return outer, content
+
+
+def paint_vertical_gradient(canvas, top_color, bottom_color, width, height):
+    canvas.delete("gradient")
+    r1, g1, b1 = canvas.winfo_rgb(top_color)
+    r2, g2, b2 = canvas.winfo_rgb(bottom_color)
+    steps = max(height, 1)
+
+    for i in range(steps):
+        nr = int(r1 + (r2 - r1) * i / steps) // 256
+        ng = int(g1 + (g2 - g1) * i / steps) // 256
+        nb = int(b1 + (b2 - b1) * i / steps) // 256
+        color = f"#{nr:02x}{ng:02x}{nb:02x}"
+        canvas.create_line(0, i, width, i, tags=("gradient",), fill=color)
+
+    canvas.lower("gradient")
 
 # グローバル変数（自動切替の一時停止状態）
 auto_switch_suspended = False
@@ -42,80 +159,127 @@ def update_time(label, state_var, info_label, status_colors):
     label.after(1000, update_time, label, state_var, info_label, status_colors)
 
 
-def create_gui(root, config):
+def create_gui(root, config, open_registration_window_callback):
     """
     メインのGUIを作成して返す。
     ・ウィンドウサイズは WVGA (800x480) に固定し、全画面で起動
     ・自動切替機能：11時前は「出勤」、11時以降は「退勤」
     ・ステータスボタン押下時は、30秒間自動切替を停止
     """
-    # カスタムフォント設定
-    noto_sans_font = font.Font(family="Noto Sans", size=16)
-    status_font = font.Font(family="Noto Sans", size=20)  # ステータス表示用の専用フォント
-    digital_font = font.Font(family="Digital-7", size=32)
+    compact_mode = True
+    noto_sans_font = font.Font(family="Noto Sans", size=14 if compact_mode else 16)
+    title_font = font.Font(family="Noto Sans", size=13 if compact_mode else 15, weight="bold")
+    status_font = font.Font(family="Noto Sans", size=18 if compact_mode else 22, weight="bold")
+    helper_font = font.Font(family="Noto Sans", size=9 if compact_mode else 11)
+    digital_font = font.Font(family="Digital-7", size=28 if compact_mode else 34)
 
     style = ttk.Style()
-    style.configure("Wide.TButton", font=noto_sans_font, padding=(10, 10))
+    style.theme_use("clam")
+    style.configure("Worktime.Treeview", rowheight=30 if compact_mode else 34, font=("Noto Sans", 10 if compact_mode else 12))
+    style.configure("Worktime.Treeview.Heading", font=("Noto Sans", 11, "bold"))
 
-    background_color = "#FAFAFA"
-    root.configure(bg=background_color)
+    root.configure(bg=SURFACE_BG)
 
     root.title("出退勤管理")
     root.geometry("800x480")
     root.resizable(False, False)
-    root.after(500, lambda: root.attributes("-fullscreen", True))
+    if not IS_MAC:
+        root.after(500, lambda: root.attributes("-fullscreen", True))
 
-    status_colors = {
-        "出勤": "#D8E3FF",
-        "退勤": "#FEE2E2",
-        "外出": "#D1FAE5",
-        "戻り": "#E9D5FF",
-    }
-    button_hover_colors = {
-        "出勤": "#BFDBFE",
-        "退勤": "#FECACA",
-        "外出": "#A7F3D0",
-        "戻り": "#D8B4FE",
-    }
-
-    main_frame = tk.Frame(root, bg=background_color, padx=10, pady=0)
+    main_frame = tk.Frame(root, bg=SURFACE_BG, padx=12 if compact_mode else 20, pady=10 if compact_mode else 18)
     main_frame.pack(expand=True, fill=tk.BOTH)
+    root._attendance_container = main_frame
+    root._registration_mode_visible = False
+
+    top_bar = tk.Frame(main_frame, bg=SURFACE_BG)
+    top_bar.pack(fill=tk.X, pady=(0, 8))
+
+    action_wrap = tk.Frame(top_bar, bg=SURFACE_BG)
+    action_wrap.pack(side=tk.RIGHT)
+
+    registration_button = tk.Label(
+        action_wrap,
+        text="カード登録",
+        font=("Noto Sans", 10 if compact_mode else 12, "bold"),
+        padx=14 if compact_mode else 18,
+        pady=7 if compact_mode else 10,
+        bd=1,
+        relief="solid",
+    )
+    registration_button.pack(side=tk.LEFT, padx=(0, 8))
+    bind_pressable_label(
+        registration_button,
+        open_registration_window_callback,
+        "#FFFFFF",
+        "#EEF5FF",
+        PRIMARY_TEXT,
+    )
 
     settings_button = tk.Label(
-        main_frame,
-        text="⚙ 設定",
-        font=noto_sans_font,
-        cursor="hand2",
-        bg=background_color,
-        fg="#1E3A8A"
+        action_wrap,
+        text="設定",
+        font=("Noto Sans", 10 if compact_mode else 12, "bold"),
+        padx=14 if compact_mode else 18,
+        pady=7 if compact_mode else 10,
+        bd=1,
+        relief="solid",
     )
-    settings_button.pack(anchor=tk.NE, pady=(0, 2))
-    settings_button.bind("<Button-1>", lambda e: open_settings_window(root, config))
+    settings_button.pack(side=tk.LEFT)
+    bind_pressable_label(
+        settings_button,
+        lambda: open_settings_window(root, config),
+        "#FFFFFF",
+        "#EEF5FF",
+        PRIMARY_TEXT,
+    )
 
-    time_frame = tk.Frame(main_frame, bg="#F5F5F5")
-    time_frame.pack(fill=tk.X, pady=(0, 8))  # 時間表示の下の空白を増やす
+    body_frame = tk.Frame(main_frame, bg=SURFACE_BG)
+    body_frame.pack(fill=tk.BOTH, expand=True)
+    left_card, left_inner = create_shadow_card(body_frame, pad=(12, 12) if compact_mode else (14, 14))
+    left_card.pack(fill=tk.BOTH, expand=True)
+
+    tk.Label(
+        left_inner,
+        text="現在時刻",
+        font=title_font,
+        bg=PANEL_BG,
+        fg=PRIMARY_TEXT,
+    ).pack(anchor=tk.W)
+
+    tk.Label(
+        left_inner,
+        text="自動切替は 11:00 を境に出勤 / 退勤を更新します",
+        font=helper_font,
+        bg=PANEL_BG,
+        fg=SECONDARY_TEXT,
+    ).pack(anchor=tk.W, pady=(2, 8 if compact_mode else 12))
+
+    time_frame = tk.Frame(left_inner, bg="#F6FAFF", padx=12 if compact_mode else 18, pady=10 if compact_mode else 18)
+    time_frame.pack(fill=tk.X, pady=(0, 8 if compact_mode else 14))
     time_label = tk.Label(
         time_frame,
         text="2 0 2 5 - 0 1 - 2 9   1 6 : 5 9 : 5 5",
         font=digital_font,
-        fg="#1E3A8A",
-        bg="#F5F5F5"
+        fg=PRIMARY_TEXT,
+        bg="#F6FAFF",
     )
-    time_label.pack(pady=2)
-    
+    time_label.pack(anchor=tk.CENTER)
+
     state_var = tk.StringVar(value="出勤")
 
     info_label = tk.Label(
-        main_frame,
+        left_inner,
         text="現在のステータス: 出勤\nカード受付待機中...",
-        font=status_font,  # 専用フォントを使用
-        fg="#1E3A8A",
-        bg=status_colors["出勤"],
+        font=status_font,
+        fg=PRIMARY_TEXT,
+        bg=STATUS_COLORS["出勤"],
         anchor="center",
         height=3,
-        wraplength=600
+        wraplength=720 if compact_mode else 640,
+        padx=12 if compact_mode else 18,
+        pady=12 if compact_mode else 18,
     )
-    info_label.pack(fill=tk.X, pady=(0, 8), padx=10)  # ステータス表示の下の空白を増やす
+    info_label.pack(fill=tk.X, pady=(0, 8 if compact_mode else 14))
 
     def suspend_auto_switch():
         global auto_switch_suspended
@@ -126,35 +290,324 @@ def create_gui(root, config):
         global auto_switch_suspended
         auto_switch_suspended = False
 
-    button_frame = tk.Frame(main_frame, bg=background_color)
-    button_frame.pack(expand=True, pady=(0, 0))
+    tk.Label(
+        left_inner,
+        text="打刻モード",
+        font=title_font,
+        bg=PANEL_BG,
+        fg=PRIMARY_TEXT,
+    ).pack(anchor=tk.W)
 
-    filtered_states = ["出勤", "退勤"]  # 表示対象のステータスを明示的に指定
+    tk.Label(
+        left_inner,
+        text="出勤または退勤を選んで、そのままカードをタッチします",
+        font=helper_font,
+        bg=PANEL_BG,
+        fg=SECONDARY_TEXT,
+    ).pack(anchor=tk.W, pady=(2, 8 if compact_mode else 12))
+
+    button_frame = tk.Frame(left_inner, bg=PANEL_BG)
+    button_frame.pack(fill=tk.BOTH, expand=True, pady=(2, 0))
+    button_frame.grid_columnconfigure(0, weight=1)
+    button_frame.grid_columnconfigure(1, weight=1)
+    button_frame.grid_columnconfigure(2, weight=1)
+    button_frame.grid_columnconfigure(3, weight=1)
+    button_frame.grid_rowconfigure(0, weight=1)
+
+    filtered_states = ["出勤", "退勤"]
 
     for i, state in enumerate(filtered_states):
-        button = tk.Button(
+        colors = BUTTON_COLORS[state]
+        button = create_rounded_button(
             button_frame,
-            text=state,
-            font=font.Font(family="Noto Sans", size=18),
-            width=12,
-            height=2,
-            bg=status_colors[state],
-            fg="#1E3A8A",
-            activebackground=button_hover_colors[state],
-            activeforeground="#1E3A8A",
-            relief="raised",
-            command=lambda s=state: [
+            state,
+            lambda s=state: [
                 state_var.set(s),
-                update_status_label(s, info_label, status_colors[s]),
-                suspend_auto_switch()
-            ]
+                update_status_label(s, info_label, STATUS_COLORS[s]),
+                suspend_auto_switch(),
+            ],
+            colors["bg"],
+            colors["active"],
+            colors["text"],
+            width=216 if compact_mode else 240,
+            height=92 if compact_mode else 84,
+            radius=22 if compact_mode else 28,
         )
-        button.grid(row=i // 2, column=i % 2, padx=25, pady=10)
+        target_column = 1 if i == 0 else 2
+        button.grid(row=0, column=target_column, pady=(0, 2))
 
-    # update_time を state_var, info_label, status_colors を渡して開始
-    update_time(time_label, state_var, info_label, status_colors)
+    update_time(time_label, state_var, info_label, STATUS_COLORS)
 
     return state_var, time_label, info_label
+
+
+def open_registration_window(
+    root,
+    registration_session,
+    sync_users_callback,
+    on_registration_selected,
+    on_registration_cleared,
+):
+    """カード登録用の同一画面ビューへ切り替える"""
+    existing_view = getattr(root, "_registration_view", None)
+    if existing_view is not None:
+        if hasattr(root, "_attendance_container"):
+            root._attendance_container.pack_forget()
+        existing_view.pack(fill=tk.BOTH, expand=True)
+        root._registration_mode_visible = True
+        if hasattr(root, "_registration_clear_selection"):
+            root._registration_clear_selection()
+        if hasattr(root, "_registration_refresh"):
+            root._registration_refresh()
+        if hasattr(root, "_registration_focus_search"):
+            root._registration_focus_search()
+        return
+
+    compact_mode = True
+    if hasattr(root, "_attendance_container"):
+        root._attendance_container.pack_forget()
+    root._registration_mode_visible = True
+    status_var = tk.StringVar(value="ユーザーを選択するとカード登録モードになります")
+    selected_user_var = tk.StringVar(value="未選択")
+    search_var = tk.StringVar()
+    summary_var = tk.StringVar(value="ユーザー 0 件")
+
+    shell = tk.Frame(root, bg=SURFACE_BG, padx=10 if compact_mode else 18, pady=10 if compact_mode else 18)
+    shell.pack(fill=tk.BOTH, expand=True)
+    root._registration_view = shell
+
+    top_bar = tk.Frame(shell, bg=SURFACE_BG)
+    top_bar.pack(fill=tk.X, pady=(0, 8))
+
+    tk.Label(
+        top_bar,
+        text="カード登録",
+        font=("Noto Sans", 14 if compact_mode else 16, "bold"),
+        bg=SURFACE_BG,
+        fg=PRIMARY_TEXT,
+    ).pack(side=tk.LEFT)
+
+    body = tk.Frame(shell, bg=SURFACE_BG)
+    body.pack(fill=tk.BOTH, expand=True)
+    if compact_mode:
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_rowconfigure(0, weight=5)
+        body.grid_rowconfigure(1, weight=1)
+        list_card, list_inner = create_shadow_card(body, pad=(10, 10))
+        list_card.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
+        side_card, side_inner = create_shadow_card(body, pad=(8, 8))
+        side_card.grid(row=1, column=0, sticky="nsew")
+    else:
+        body.grid_columnconfigure(0, weight=5)
+        body.grid_columnconfigure(1, weight=2)
+        body.grid_rowconfigure(0, weight=1)
+        list_card, list_inner = create_shadow_card(body)
+        list_card.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
+        side_card, side_inner = create_shadow_card(body)
+        side_card.grid(row=0, column=1, sticky="nsew")
+
+    toolbar = tk.Frame(list_inner, bg=PANEL_BG)
+    toolbar.pack(fill=tk.X, pady=(0, 12))
+
+    tk.Label(toolbar, text="ユーザー検索", font=("Noto Sans", 11 if compact_mode else 12, "bold"), bg=PANEL_BG, fg=PRIMARY_TEXT).pack(side=tk.LEFT)
+
+    search_entry = tk.Entry(
+        toolbar,
+        textvariable=search_var,
+        font=("Noto Sans", 11 if compact_mode else 12),
+        relief="flat",
+        bg="#F4F8FC",
+        fg=PRIMARY_TEXT,
+        insertbackground=PRIMARY_TEXT,
+        width=18 if compact_mode else 24,
+    )
+    search_entry.pack(side=tk.RIGHT, padx=(10, 0), ipady=6 if compact_mode else 8)
+
+    tk.Label(toolbar, textvariable=summary_var, font=("Noto Sans", 10 if compact_mode else 11), bg=PANEL_BG, fg=SECONDARY_TEXT).pack(side=tk.RIGHT)
+
+    columns = ("ID", "名前", "ログインID", "カード")
+    user_tree = ttk.Treeview(list_inner, columns=columns, show="headings", height=7 if compact_mode else 14, style="Worktime.Treeview")
+    for col in columns:
+        user_tree.heading(col, text=col)
+    user_tree.column("ID", width=105 if compact_mode else 130, anchor=tk.W)
+    user_tree.column("名前", width=140 if compact_mode else 180, anchor=tk.W)
+    user_tree.column("ログインID", width=120 if compact_mode else 180, anchor=tk.W)
+    user_tree.column("カード", width=120 if compact_mode else 180, anchor=tk.W)
+    user_tree.pack(fill=tk.BOTH, expand=True)
+
+    if compact_mode:
+        selected_panel = tk.Frame(side_inner, bg=ACCENT_BLUE_SOFT, padx=10, pady=8)
+        selected_panel.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(selected_panel, text="登録対象", font=("Noto Sans", 11, "bold"), bg=ACCENT_BLUE_SOFT, fg=PRIMARY_TEXT).pack(anchor=tk.W)
+        tk.Label(selected_panel, textvariable=selected_user_var, font=("Noto Sans", 11), bg=ACCENT_BLUE_SOFT, fg=PRIMARY_TEXT, wraplength=680, justify="left").pack(anchor=tk.W, pady=(4, 0))
+        tk.Label(selected_panel, textvariable=status_var, font=("Noto Sans", 10), bg=ACCENT_BLUE_SOFT, fg=SECONDARY_TEXT, wraplength=680, justify="left").pack(anchor=tk.W, pady=(2, 0))
+
+        help_row = tk.Frame(side_inner, bg=PANEL_BG)
+        help_row.pack(fill=tk.X)
+        for title, desc, bg in [
+            ("1. 選択", "対象ユーザーを一覧で選ぶ", "#F7FAFE"),
+            ("2. 登録", "カードをタッチして紐付け", "#FEF3C7"),
+        ]:
+            box = tk.Frame(help_row, bg=bg, padx=8, pady=6)
+            box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
+            tk.Label(box, text=title, font=("Noto Sans", 10, "bold"), bg=bg, fg=PRIMARY_TEXT).pack(anchor=tk.W)
+            tk.Label(box, text=desc, font=("Noto Sans", 9), bg=bg, fg=SECONDARY_TEXT, wraplength=300, justify="left").pack(anchor=tk.W, pady=(1, 0))
+    else:
+        right_sections = [
+            ("1. ユーザーを選択", "一覧から対象者を選ぶと、登録待機モードに切り替わります。"),
+            ("2. カードをタッチ", "選択中のユーザーへカード番号を紐付けます。"),
+            ("3. 必要なら最新化", "サーバー側でユーザーが増えた場合は「最新化」で再取得します。"),
+        ]
+        for title, desc in right_sections:
+            section = tk.Frame(side_inner, bg="#F7FAFE", padx=14, pady=12)
+            section.pack(fill=tk.X, pady=(0, 10))
+            tk.Label(section, text=title, font=("Noto Sans", 12, "bold"), bg="#F7FAFE", fg=PRIMARY_TEXT).pack(anchor=tk.W)
+            tk.Label(section, text=desc, font=("Noto Sans", 11), bg="#F7FAFE", fg=SECONDARY_TEXT, justify="left", wraplength=220).pack(anchor=tk.W, pady=(4, 0))
+
+        selected_panel = tk.Frame(side_inner, bg=ACCENT_BLUE_SOFT, padx=14, pady=14)
+        selected_panel.pack(fill=tk.X, pady=(4, 0))
+        tk.Label(selected_panel, text="登録対象", font=("Noto Sans", 12, "bold"), bg=ACCENT_BLUE_SOFT, fg=PRIMARY_TEXT).pack(anchor=tk.W)
+        tk.Label(selected_panel, textvariable=selected_user_var, font=("Noto Sans", 12), bg=ACCENT_BLUE_SOFT, fg=PRIMARY_TEXT, wraplength=220, justify="left").pack(anchor=tk.W, pady=(6, 0))
+        tk.Label(selected_panel, textvariable=status_var, font=("Noto Sans", 11), bg=ACCENT_BLUE_SOFT, fg=SECONDARY_TEXT, wraplength=220, justify="left").pack(anchor=tk.W, pady=(6, 0))
+
+    def load_users():
+        for item in user_tree.get_children():
+            user_tree.delete(item)
+        keyword = search_var.get().strip().lower()
+        users = get_all_users()
+        visible_count = 0
+        for user in users:
+            haystack = " ".join(
+                [
+                    str(user["res_user_id"] or ""),
+                    str(user["name"] or ""),
+                    str(user["login_id"] or ""),
+                    str(user["id_serial"] or ""),
+                ]
+            ).lower()
+            if keyword and keyword not in haystack:
+                continue
+            serial_text = user["id_serial"] if user["id_serial"] else "未登録"
+            user_tree.insert(
+                "",
+                tk.END,
+                values=(user["res_user_id"], user["name"], user["login_id"], serial_text),
+            )
+            visible_count += 1
+        summary_var.set(f"ユーザー {visible_count} 件")
+
+    def clear_selection():
+        selected_items = user_tree.selection()
+        if selected_items:
+            user_tree.selection_remove(selected_items)
+        registration_session.clear()
+        selected_user_var.set("未選択")
+        status_var.set("ユーザーを選択するとカード登録モードになります")
+        on_registration_cleared()
+
+    def handle_user_selected(_event=None):
+        selection = user_tree.selection()
+        if not selection:
+            clear_selection()
+            return
+        values = user_tree.item(selection[0])["values"]
+        user_id = values[0]
+        user_name = values[1]
+        registration_session.select_user(user_id, user_name)
+        selected_user_var.set(f"選択中: {user_name} ({user_id})")
+        status_var.set("カードをタッチしてください")
+        on_registration_selected(user_name)
+
+    def refresh_users():
+        status_var.set("ユーザー一覧を更新中...")
+
+        def worker():
+            success = sync_users_callback()
+
+            def finish():
+                load_users()
+                clear_selection()
+                status_var.set(
+                    "ユーザー一覧を更新しました" if success else "更新に失敗しました"
+                )
+
+            root.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def close_window():
+        clear_selection()
+        root._registration_mode_visible = False
+        shell.pack_forget()
+        if hasattr(root, "_attendance_container"):
+            root._attendance_container.pack(expand=True, fill=tk.BOTH)
+        search_var.set("")
+
+    action_wrap = tk.Frame(top_bar, bg=SURFACE_BG)
+    action_wrap.pack(side=tk.RIGHT)
+
+    back_button = tk.Label(
+        action_wrap,
+        text="戻る",
+        font=("Noto Sans", 10 if compact_mode else 12, "bold"),
+        padx=14 if compact_mode else 18,
+        pady=7 if compact_mode else 10,
+        bd=1,
+        relief="solid",
+    )
+    back_button.pack(side=tk.RIGHT)
+    bind_pressable_label(
+        back_button,
+        close_window,
+        "#FFFFFF",
+        "#EEF5FF",
+        PRIMARY_TEXT,
+    )
+
+    clear_button = tk.Label(
+        action_wrap,
+        text="選択解除",
+        font=("Noto Sans", 10 if compact_mode else 12, "bold"),
+        padx=14 if compact_mode else 18,
+        pady=7 if compact_mode else 10,
+        bd=1,
+        relief="solid",
+    )
+    clear_button.pack(side=tk.RIGHT, padx=(0, 8))
+    bind_pressable_label(
+        clear_button,
+        clear_selection,
+        "#FFFFFF",
+        "#EEF5FF",
+        PRIMARY_TEXT,
+    )
+
+    refresh_button = tk.Label(
+        action_wrap,
+        text="最新化",
+        font=("Noto Sans", 10 if compact_mode else 12, "bold"),
+        padx=14 if compact_mode else 18,
+        pady=7 if compact_mode else 10,
+        bd=1,
+        relief="solid",
+    )
+    refresh_button.pack(side=tk.RIGHT, padx=(0, 8))
+    bind_pressable_label(
+        refresh_button,
+        refresh_users,
+        "#FFFFFF",
+        "#EEF5FF",
+        PRIMARY_TEXT,
+    )
+
+    user_tree.bind("<<TreeviewSelect>>", handle_user_selected)
+    search_var.trace_add("write", lambda *_args: load_users())
+    load_users()
+    search_entry.focus_set()
+    root._registration_refresh = load_users
+    root._registration_focus_search = search_entry.focus_set
+    root._registration_clear_selection = clear_selection
+    root._close_registration_view = close_window
 
 
 def update_status_label(state, info_label, bg_color=None):
@@ -204,7 +657,7 @@ def update_user_label(info_label, info, state, status_color, text_color="#1E3A8A
         info_label.config(
             text=f"現在のステータス: {state}\nカード受付待機中...",
             bg=reset_bg,
-            fg=default_fg,
+            fg=PRIMARY_TEXT,
             font=default_font
         )
         touch_notification_active = False  # 通知終了
