@@ -1,6 +1,6 @@
 [Unit]
 Description=Worktime Management Application
-After=network.target graphical.target
+After=network.target graphical.target display-manager.service
 
 [Service]
 Type=simple
@@ -10,6 +10,7 @@ Environment=DISPLAY=:0
 Environment=XAUTHORITY=/home/pi/.Xauthority
 # Xサーバーが利用可能になるまで待機
 ExecStartPre=/bin/sh -c 'until xset q >/dev/null 2>&1; do sleep 1; done'
+ExecStartPre=/bin/sleep 2
 ExecStart=/usr/bin/python3 /home/pi/dev/worktime/main.py
 Restart=always
 RestartSec=3

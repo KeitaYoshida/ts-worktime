@@ -83,6 +83,8 @@ def signal_handler(sig, frame):
     if root is not None:
         try:
             root.attributes("-fullscreen", False)
+            if IS_LINUX:
+                root.overrideredirect(False)
         except Exception as e:
             logger.error(f"全画面解除エラー: {e}")
         root.quit()
@@ -238,10 +240,10 @@ def main():
 
             def clear_registration_mode():
                 current_state = state_var.get()
-                current_bg = "#D8E3FF" if current_state == "出勤" else "#FEE2E2"
+                current_bg = "#4F7DFF" if current_state == "出勤" else "#FF8A7A"
                 info_label.config(
                     text=f"現在のステータス: {current_state}\nカード受付待機中...",
-                    fg="#1E3A8A",
+                    fg="#FFFFFF",
                     bg=current_bg,
                 )
 
@@ -256,6 +258,7 @@ def main():
                     show_registration_mode,
                     clear_registration_mode,
                 ),
+                lambda: root.event_generate("<<RequestClose>>", when="tail"),
             )
 
             # スレッド停止用イベント
@@ -436,10 +439,17 @@ def main():
                 registration_session.clear()
                 clear_registration_mode()
                 notifier.notify("STOPPING=1")
+                if IS_LINUX:
+                    try:
+                        root.overrideredirect(False)
+                        root.attributes("-fullscreen", False)
+                    except tk.TclError:
+                        pass
                 root.destroy()
                 sys.exit(0)
 
             root.protocol("WM_DELETE_WINDOW", on_closing)
+            root.bind("<<RequestClose>>", lambda _event: on_closing())
 
             # エラーハンドラ
             def handle_exception(exc_type, exc_value, exc_traceback):
