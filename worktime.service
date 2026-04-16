@@ -1,0 +1,20 @@
+[Unit]
+Description=Worktime Management Application
+After=network.target graphical.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/dev/worktime
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/pi/.Xauthority
+# Xサーバーが利用可能になるまで待機
+ExecStartPre=/bin/sh -c 'until xset q >/dev/null 2>&1; do sleep 1; done'
+ExecStart=/usr/bin/python3 /home/pi/dev/worktime/main.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/home/pi/dev/worktime/logs/worktime.service.log
+StandardError=append:/home/pi/dev/worktime/logs/worktime.service.error.log
+
+[Install]
+WantedBy=graphical.target 
