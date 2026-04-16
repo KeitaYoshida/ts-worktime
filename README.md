@@ -3,6 +3,14 @@
 Raspberry Pi 向けに作成した勤怠管理アプリです。  
 通常運用は Raspberry Pi 前提ですが、開発確認用として Mac でも GUI を起動できるようにしています。
 
+実運用向けのローカルファイルは Git 管理から外しています。
+
+- 実設定: `config.json`
+- 設定雛形: `config.example.json`
+- ログ: `logs/*.log`
+- ローカルDB: `attendance.db`
+- 同期済みユーザーデータ: `user_data.json`
+
 ## Mac 開発モードについて
 
 Mac では以下の機能は無効になります。
